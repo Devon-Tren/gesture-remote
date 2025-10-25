@@ -8,9 +8,6 @@
     "start": "next start"
   },
   "dependencies": {
-    "@mediapipe/camera_utils": "^0.3.1675466862",
-    "@mediapipe/drawing_utils": "^0.3.1675466124",
-    "@mediapipe/hands": "^0.4.1675469240",
     "next": "15.5.4",
     "react": "19.1.0",
     "react-dom": "19.1.0",

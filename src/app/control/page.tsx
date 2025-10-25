@@ -1,87 +1,539 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { Hands, HAND_CONNECTIONS } from "@mediapipe/hands";
-import { Camera } from "@mediapipe/camera_utils";
-import { drawConnectors, drawLandmarks } from "@mediapipe/drawing_utils";
-import { io } from "socket.io-client";
+import { useEffect, useRef, useState } from "react";
+import { io, Socket } from "socket.io-client";
 
-// 👇 connect to API route
-const socket = io("http://localhost:3000", { path: "/socket.io" });
+type MPHands = any;
+type MPDraw = any;
+type Gesture = "pause" | "unpause" | "next" | "prev";
 
+/* ========= Tunables (market-grade) ========= */
+const MIRROR_FOR_USER = true;
+
+// Detection (tolerant to brief drops / occlusion)
+const MIN_DET = 0.35;
+const MP_MIN_DET = 0.75;
+const MP_MIN_TRK = 0.70;
+
+// Grace buffer for missed frames
+const MISS_CLEAR_FRAMES = 6;   // ~100ms @ 60fps
+const HOLD_LAST_MS = 280;
+
+// Swipe/flick timing
+const MAX_FLICK_MS = 220;      // two-finger flick must complete quickly
+const ARM_STILL_MS = 70;       // brief stillness before arming
+const COOLDOWN_NEXT_PREV = 500;
+
+// Pause toggle (fist hold)
+const FIST_HOLD_FRAMES = 5;    // ~250–300ms @ 60fps
+const PAUSE_COOLDOWN_MS = 600;
+
+// Velocity smoothing
+const VX_SHORT_ALPHA = 0.60;
+const VX_LONG_ALPHA = 0.33;
+const ACCEL_GAIN = 0.50;
+
+// Distance normalization
+const VX_TRIG_BASE = 0.0020;   // base |vx| trigger around mid distance
+const VX_TRIG_FLOOR = 0.0008;
+
+// Horizontal dominance (squared energy ratio X/Y)
+const RATIO_MIN = 1.25;
+
+// Vertical motion veto for flick
+const VETO_Y = 0.55;           // if |vy| energy too high vs |vx| → veto
+
+/* ================ Component ================ */
 export default function ControlPage() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState("Waiting for hand…");
+  const [showHelp, setShowHelp] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const handsRef = useRef<MPHands | null>(null);
+  const drawRef = useRef<MPDraw | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+
+  // General state
+  const pausedRef = useRef(false);
+  const lastEmitRef = useRef(0);
+  const lastActionAtRef = useRef(0);
+
+  // Grace buffer
+  const missStreakRef = useRef(0);
+  const lastGoodTsRef = useRef(0);
+  const lastGoodHandsRef = useRef<Array<Array<{x:number;y:number;z:number}>> | null>(null);
+
+  // Distance norm
+  const palmScaleEMARef = useRef(0.08);
+
+  // Fist hold (pause)
+  const fistHoldRef = useRef(0);
+  const pauseCooldownUntilRef = useRef(0);
+
+  // Two-finger flick engine
+  const anchorRef = useRef<{ x:number; y:number; t:number } | null>(null);
+  const lastXRef = useRef<number | null>(null);
+  const lastYRef = useRef<number | null>(null);
+  const lastTRef = useRef<number | null>(null);
+  const vxShortEMARef = useRef(0);
+  const vxLongEMARef = useRef(0);
+  const prevVxEMARef = useRef(0);
+  const microJitterEMARef = useRef(0);
+  const vxWinRef = useRef<number[]>([]);
+  const vyWinRef = useRef<number[]>([]);
+  const startStillRef = useRef(0);
+  const armedRef = useRef(false);
+  const nextPrevCooldownUntilRef = useRef(0);
+
+  const vxTrigRef = useRef(VX_TRIG_BASE);
+
+  /* ------------- helpers ------------- */
+  const now = () => performance.now();
+  const clamp = (v:number, a=0, b=1) => Math.max(a, Math.min(b, v));
+  const ema = (p:number|null, c:number, a:number) => (p==null ? c : a*p + (1-a)*c);
+  const withinCooldown = (until:number) => now() > until;
+
+  function emit(action: Gesture) {
+    socketRef.current?.emit("control-action", action);
+    setStatus(
+      action === "pause" ? "⏸ Paused" :
+      action === "unpause" ? "▶️ Playing" :
+      action === "next" ? "➡️ Next" : "⬅️ Previous"
+    );
+    lastEmitRef.current = now();
+    lastActionAtRef.current = Date.now();
+  }
+
+  function recalibrateSwipe() {
+    anchorRef.current = null;
+    startStillRef.current = 0;
+    armedRef.current = false;
+    vxShortEMARef.current = 0;
+    vxLongEMARef.current = 0;
+    prevVxEMARef.current = 0;
+    microJitterEMARef.current = 0;
+    vxWinRef.current = [];
+    vyWinRef.current = [];
+    setStatus("Recalibrated.");
+  }
 
   useEffect(() => {
-    if (!videoRef.current || !canvasRef.current) return;
+    let cancelled = false;
 
-    const hands = new Hands({
-      locateFile: (file) =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-    });
+    const loadScript = (src:string) =>
+      new Promise<void>((res, rej) => {
+        const s = document.createElement("script");
+        s.src = src; s.async = true;
+        s.onload = () => res();
+        s.onerror = rej;
+        document.head.appendChild(s);
+      });
 
-    hands.setOptions({
-      maxNumHands: 1,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.7,
-    });
+    async function init() {
+      try { await fetch("/api/socket"); } catch {}
+      const s = io("/", { path: "/api/socket_io", transports: ["websocket","polling"], reconnection: true });
+      socketRef.current = s;
+      s.on("connect", () => setConnected(true));
+      s.on("disconnect", () => setConnected(false));
 
-    hands.onResults((results) => {
-      const canvas = canvasRef.current!;
-      const ctx = canvas.getContext("2d")!;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+      await loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js");
+      await loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js");
+      if (cancelled) return;
 
-      if (results.multiHandLandmarks) {
-        for (const landmarks of results.multiHandLandmarks) {
-          drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
-            color: "#00FF00",
-            lineWidth: 4,
-          });
-          drawLandmarks(ctx, landmarks, { color: "#FF0000", lineWidth: 2 });
+      // @ts-ignore
+      const Hands = (window as any).Hands;
+      // @ts-ignore
+      drawRef.current = (window as any);
 
-          // 👌 Pinch Detector
-          const thumbTip = landmarks[4];
-          const indexTip = landmarks[8];
-          const dx = thumbTip.x - indexTip.x;
-          const dy = thumbTip.y - indexTip.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
+      const hands = new Hands({
+        locateFile: (file:string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      });
+      hands.setOptions({
+        selfieMode: true,
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: MP_MIN_DET,
+        minTrackingConfidence: MP_MIN_TRK,
+      });
+      hands.onResults(onResults);
+      handsRef.current = hands;
 
-          if (dist < 0.05) {
-            socket.emit("gesture", { action: "next" });
-          }
-        }
+      const video = videoRef.current!;
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      setStatus("Waiting for hand…");
+
+      let rafId = 0;
+      const loop = async () => {
+        if (cancelled) return;
+        if (video.readyState >= 2) await hands.send({ image: video });
+        rafId = requestAnimationFrame(loop);
+      };
+      loop();
+      return () => cancelAnimationFrame(rafId);
+    }
+
+    init();
+
+    const vis = () => {
+      if (document.visibilityState !== "visible") {
+        recalibrateSwipe();
+        lastXRef.current = lastYRef.current = lastTRef.current = null;
       }
-    });
+    };
+    document.addEventListener("visibilitychange", vis, { passive: true });
 
-    const camera = new Camera(videoRef.current!, {
-      onFrame: async () => {
-        await hands.send({ image: videoRef.current! });
-      },
-      width: 640,
-      height: 480,
-    });
-    camera.start();
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", vis);
+      handsRef.current?.close();
+      socketRef.current?.close();
+      const v = videoRef.current;
+      if (v?.srcObject) (v.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+    };
   }, []);
 
-  return (
-    <main
-      className="flex min-h-screen flex-col items-center justify-center gap-6"
-      style={{ backgroundColor: "#00CED1" }}
-    >
-      <h1 className="text-5xl font-extrabold text-white drop-shadow-lg">
-        Control Mode
-      </h1>
+  /* ------------- onResults ------------- */
+  function onResults(results:any) {
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext("2d")!;
+    const video = videoRef.current!;
 
-      <video ref={videoRef} className="hidden" />
-      <canvas
-        ref={canvasRef}
-        width={640}
-        height={480}
-        className="border-4 border-white rounded-xl shadow-lg"
-      />
+    const w = canvas.clientWidth || video.videoWidth || 1280;
+    const h = canvas.clientHeight || video.videoHeight || 720;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+
+    // Draw mirrored video
+    ctx.save(); ctx.scale(-1,1); ctx.drawImage(video, -w, 0, w, h); ctx.restore();
+
+    const hands = results.multiHandLandmarks as Array<Array<{x:number;y:number;z:number}>> | undefined;
+    const conf = (results.multiHandedness?.[0]?.score ?? 1) as number;
+    const detOK = !!hands && hands.length > 0 && conf >= MIN_DET;
+
+    if (detOK) {
+      missStreakRef.current = 0;
+      lastGoodTsRef.current = now();
+      lastGoodHandsRef.current = hands!;
+      if (status === "Waiting for hand…") setStatus("Tracking… Two-finger flick for Next/Prev; Fist-hold to Pause.");
+    } else {
+      missStreakRef.current++;
+    }
+
+    const withinGrace = !detOK && lastGoodHandsRef.current && (now() - lastGoodTsRef.current) <= HOLD_LAST_MS;
+    const lmSet = detOK ? hands! : (withinGrace ? lastGoodHandsRef.current! : null);
+
+    if (!lmSet) {
+      if (missStreakRef.current >= MISS_CLEAR_FRAMES) recalibrateSwipe();
+      drawStatusHUD(ctx, "Waiting for hand…");
+      return;
+    }
+
+    // Draw all hands
+    for (const lm of lmSet) drawHand(ctx, lm);
+
+    // ---- Pause/Unpause: Fist hold (any hand) ----
+    const fistAny = lmSet.some(lm => fistConfFromCurl(lm) > 0.92);
+    if (fistAny) fistHoldRef.current++; else fistHoldRef.current = 0;
+
+    if (fistHoldRef.current >= FIST_HOLD_FRAMES && now() > pauseCooldownUntilRef.current) {
+      fistHoldRef.current = 0;
+      pauseCooldownUntilRef.current = now() + PAUSE_COOLDOWN_MS;
+      if (!pausedRef.current) { pausedRef.current = true; emit("pause"); }
+      else { pausedRef.current = false; emit("unpause"); recalibrateSwipe(); }
+    }
+
+    // ---- Next/Prev: Two-finger flick (index+middle extended, others curled) ----
+    // Pick a hand that matches the posture best; otherwise use first
+    const scored = lmSet.map(lm => ({ lm, score: twoFingerPoseScore(lm) }));
+    scored.sort((a,b)=>b.score - a.score);
+    const cand = scored[0];
+    const lm = cand.lm;
+
+    // Only run flick detector if posture looks like two-finger pose
+    if (cand.score >= 0.65) {
+      runFlickEngine(lm, ctx, w, h);
+    } else {
+      // posture not ready → clear arming state
+      anchorRef.current = null;
+      startStillRef.current = 0;
+      armedRef.current = false;
+      vxShortEMARef.current = 0; vxLongEMARef.current = 0; prevVxEMARef.current = 0;
+      microJitterEMARef.current = 0; vxWinRef.current = []; vyWinRef.current = [];
+    }
+
+    drawStatusHUD(ctx, status);
+  }
+
+  /* --------- Flick engine (two-finger) ---------- */
+  function runFlickEngine(lm:any[], ctx:CanvasRenderingContext2D, w:number, h:number) {
+    const B = palmBasis(lm);
+    const tip = twoFingerTip(lm); // average of index+middle tips
+    const tipX = MIRROR_FOR_USER ? (1 - tip.x) : tip.x;
+    const tipY = tip.y;
+
+    // Distance normalization
+    const scaleNow = palmScale(lm);
+    const scaleEMA = (palmScaleEMARef.current = ema(palmScaleEMARef.current, scaleNow, 0.22)!);
+    const scaleRef = 0.08;
+    const scaleFactor = clamp(scaleRef / Math.max(1e-5, scaleEMA), 0.40, 2.6);
+
+    const t = now();
+    if (lastXRef.current != null && lastYRef.current != null && lastTRef.current != null) {
+      const dt = Math.max(1, t - lastTRef.current);
+      const dxi = tipX - (lastXRef.current as number);
+      const dyi = tipY - (lastYRef.current as number);
+
+      // screen & palm velocities
+      const vxScr = dxi / dt, vyScr = dyi / dt;
+      const dxPalm = dxi * B.xvx + dyi * B.xvy;
+      const dyPalm = dxi * B.yvx + dyi * B.yvy;
+      const vxPalm = dxPalm / dt, vyPalm = dyPalm / dt;
+
+      // robust blend
+      const vx = 0.70 * vxScr + 0.30 * vxPalm;
+      const vy = 0.70 * vyScr + 0.30 * vyPalm;
+
+      // EMA + accel
+      const vxS = (vxShortEMARef.current = ema(vxShortEMARef.current, vx, VX_SHORT_ALPHA)!);
+      const vxL = (vxLongEMARef.current  = ema(vxLongEMARef.current , vx, VX_LONG_ALPHA)!);
+      const vxEMA = Math.abs(vxS) > Math.abs(vxL) ? vxS : vxL;
+      const ax = (vxEMA - prevVxEMARef.current) / dt;
+      prevVxEMARef.current = vxEMA;
+
+      // distance-aware trigger
+      const VX_TRIG = Math.max(VX_TRIG_FLOOR, vxTrigRef.current * scaleFactor);
+      const jitterSample = Math.min(Math.abs(vxEMA), VX_TRIG * 0.5);
+      microJitterEMARef.current = ema(microJitterEMARef.current, jitterSample, 0.20)!;
+      const deadzone = microJitterEMARef.current * 1.15;
+
+      // arming: short stillness
+      const speed = Math.hypot(vx, vy);
+      if (speed < VX_TRIG * 0.35) {
+        if (!armedRef.current) startStillRef.current += dt;
+        if (startStillRef.current >= ARM_STILL_MS) armedRef.current = true;
+      } else if (!anchorRef.current) {
+        startStillRef.current = 0; armedRef.current = false;
+      }
+
+      // set/maintain anchor
+      if (armedRef.current && !anchorRef.current) anchorRef.current = { x: tipX, y: tipY, t };
+      const anc = anchorRef.current;
+      const dtAnc = anc ? t - anc.t : 0;
+
+      // energy & vetoes
+      pushSigned(vxWinRef.current, vx, 10);
+      pushSigned(vyWinRef.current, vy, 10);
+      const ex = energy(vxWinRef.current);
+      const ey = energy(vyWinRef.current);
+      const ratioOK = ex / Math.max(1e-6, ey) > (RATIO_MIN * RATIO_MIN);
+      const yVeto = ey > ex * VETO_Y;
+
+      // score & fire
+      const accelBoost = clamp(Math.abs(ax) / (0.00008 * scaleFactor), 0, 1);
+      const velMag = Math.max(0, Math.abs(vxEMA) - deadzone);
+      const velScore = (velMag / VX_TRIG) * (1 + ACCEL_GAIN * accelBoost);
+
+      const fastEnough = velScore >= 1.0;
+      const withinWindow = anc ? dtAnc <= MAX_FLICK_MS : false;
+      const cooled = now() > nextPrevCooldownUntilRef.current;
+
+      if (cooled && armedRef.current && withinWindow && fastEnough && ratioOK && !yVeto) {
+        const action: Gesture = vxEMA > 0 ? "next" : "prev";
+        emit(action);
+        nextPrevCooldownUntilRef.current = now() + COOLDOWN_NEXT_PREV;
+
+        // learn trigger slightly if borderline
+        if (velScore < 1.05) vxTrigRef.current = Math.max(VX_TRIG_FLOOR, vxTrigRef.current * 0.985);
+
+        // reset flick state
+        anchorRef.current = null;
+        startStillRef.current = 0;
+        armedRef.current = false;
+        vxWinRef.current = []; vyWinRef.current = [];
+        vxShortEMARef.current = 0; vxLongEMARef.current = 0; prevVxEMARef.current = 0;
+        microJitterEMARef.current = 0;
+      }
+
+      // expire window
+      if (anc && dtAnc > MAX_FLICK_MS) {
+        anchorRef.current = null;
+        startStillRef.current = 0;
+        armedRef.current = false;
+        vxWinRef.current = []; vyWinRef.current = [];
+        vxShortEMARef.current = 0; vxLongEMARef.current = 0; prevVxEMARef.current = 0;
+        microJitterEMARef.current = 0;
+      }
+    }
+
+    lastXRef.current = tipX; lastYRef.current = tipY; lastTRef.current = t;
+
+    // progress meter (optional tiny bar showing flick charge)
+    const score = Math.min(1, Math.max(0, (Math.abs(vxShortEMARef.current) - microJitterEMARef.current * 1.15) /
+                                       Math.max(VX_TRIG_FLOOR, vxTrigRef.current * clamp(0.08 / palmScaleEMARef.current, 0.4, 2.6))));
+    drawProgress(ctx, score, 1, w, h);
+  }
+
+  /* ------------- Drawing ------------- */
+  function drawHand(ctx:CanvasRenderingContext2D, lm:any[]) {
+    const d = drawRef.current; if (!d) return;
+    d.drawLandmarks(ctx, lm, { radius: 2.3 });
+    const HC = (window as any).HAND_CONNECTIONS || (window as any).hands?.HAND_CONNECTIONS || null;
+    if (HC) d.drawConnectors(ctx, lm, HC, { lineWidth: 3 });
+  }
+
+  function drawProgress(ctx:CanvasRenderingContext2D, score:number, fire:number, w:number, h:number) {
+    const x=16, y=h-44, W=220, H=10;
+    const p = clamp(score / fire, 0, 1);
+    ctx.save();
+    ctx.fillStyle="rgba(0,0,0,0.35)"; ctx.fillRect(x-6,y-H-6,W+12,H+12);
+    ctx.fillStyle="rgba(255,255,255,0.25)"; ctx.fillRect(x,y-H,W,H);
+    ctx.fillStyle="rgba(255,255,255,0.92)"; ctx.fillRect(x,y-H,W*p,H);
+    ctx.restore();
+  }
+
+  function drawStatusHUD(ctx:CanvasRenderingContext2D, text:string) {
+    ctx.save();
+    ctx.fillStyle="rgba(0,0,0,0.55)"; ctx.fillRect(12,12,520,82);
+    ctx.fillStyle="white"; ctx.font="14px ui-sans-serif, system-ui, -apple-system";
+    ctx.fillText(text, 22, 38);
+    const age = Date.now() - lastActionAtRef.current;
+    if (age < 1100 && lastEmitRef.current) {
+      ctx.globalAlpha = 1 - age / 1100;
+      ctx.fillText("✓ sent", 440, 62);
+    }
+    ctx.restore();
+  }
+
+  /* ------------- Math / posture ------------- */
+  function tip(lm:any, i:number){ return lm[i]; }
+  function pip(lm:any, i:number){ return lm[i]; }
+  function dist(a:any,b:any){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+  function palmScale(lm:any) {
+    const width = dist(lm[5], lm[17]);
+    const height = dist(lm[0], lm[9]);
+    return (width + height) / 2;
+  }
+
+  function palmBasis(lm:any) {
+    let xvx = lm[17].x - lm[5].x, xvy = lm[17].y - lm[5].y;
+    const xlen = Math.hypot(xvx,xvy)||1e-6; xvx/=xlen; xvy/=xlen;
+    let yvx = lm[9].x - lm[0].x, yvy = lm[9].y - lm[0].y;
+    const dot = yvx*xvx + yvy*xvy; yvx -= dot*xvx; yvy -= dot*xvy;
+    const ylen = Math.hypot(yvx,yvy)||1e-6; yvx/=ylen; yvy/=ylen;
+    return { xvx, xvy, yvx, yvy };
+  }
+
+  function opennessConf(lm:any) {
+    const wrist = lm[0];
+    const tips = [4,8,12,16,20].map(i=>lm[i]);
+    const mcps = [5,9,13,17].map(i=>lm[i]);
+    const handScale = mcps.reduce((s:number,p:any)=>s+dist(p,wrist),0)/mcps.length || 1;
+    const avgTip = tips.reduce((s:number,p:any)=>s+dist(p,wrist),0)/tips.length;
+    let open = avgTip/handScale; open = Math.min(1.3, Math.max(0.2, open));
+    return (open - 0.2) / (1.3 - 0.2);
+  }
+
+  function curlAmount(lm:any, tipIdx:number, pipIdx:number, mcpIdx:number) {
+    // compare segment angles: (PIP->TIP) vs (MCP->PIP)
+    const a = lm[tipIdx], b = lm[pipIdx], c = lm[mcpIdx];
+    const v1x = a.x - b.x, v1y = a.y - b.y;
+    const v2x = b.x - c.x, v2y = b.y - c.y;
+    const dot = v1x*v2x + v1y*v2y;
+    const n1 = Math.hypot(v1x,v1y)||1e-6, n2=Math.hypot(v2x,v2y)||1e-6;
+    const cos = clamp(dot/(n1*n2), -1, 1);
+    // map cos to 0..1 curl (1 = fully curled)
+    return (1 - cos) * 0.5;
+  }
+
+  function fingerExtendedScore(lm:any, tipIdx:number, pipIdx:number, mcpIdx:number) {
+    const curl = curlAmount(lm, tipIdx, pipIdx, mcpIdx); // 0(open) .. 1(curled)
+    const open = 1 - curl;
+    // weight with distance from wrist to reduce false positives very close to camera
+    const wrist = lm[0];
+    const tipd = dist(lm[tipIdx], wrist) / Math.max(1e-6, palmScale(lm));
+    return clamp(0.5*open + 0.5*clamp((tipd-0.5)/0.6, 0, 1), 0, 1);
+  }
+
+  // Two-finger pose: index + middle extended together; ring+pinky curled
+  function twoFingerPoseScore(lm:any) {
+    const idx = fingerExtendedScore(lm, 8,6,5);
+    const mid = fingerExtendedScore(lm,12,10,9);
+    const ring = 1 - fingerExtendedScore(lm,16,14,13);
+    const pink = 1 - fingerExtendedScore(lm,20,18,17);
+    // closeness between the two tips (together) vs base width
+    const base = dist(lm[5], lm[17]) || 1;
+    const together = 1 - clamp(dist(lm[8], lm[12]) / (0.8*base), 0, 1);
+    // discourage thumb-only shapes
+    const openAll = opennessConf(lm);
+    const pose = 0.35*idx + 0.35*mid + 0.15*together + 0.10*ring + 0.05*pink;
+    // mild bias for openness (but not required)
+    return clamp(0.8*pose + 0.2*openAll, 0, 1);
+  }
+
+  function twoFingerTip(lm:any){ return { x:(lm[8].x + lm[12].x)/2, y:(lm[8].y + lm[12].y)/2 }; }
+
+  function fistConfFromCurl(lm:any) {
+    const tips=[8,12,16,20], pips=[6,10,14,18];
+    const sum = tips.reduce((s,t,i)=> s + dist(lm[t], lm[pips[i]]), 0) / tips.length;
+    // normalize: smaller sum → more curled
+    let c = 1 - (sum - 0.02) / (0.12 - 0.02);
+    return clamp(c, 0, 1);
+  }
+
+  function pushSigned(win:number[], v:number, cap:number){ win.push(v); if (win.length>cap) win.shift(); }
+  function energy(xs:number[]){ return xs.reduce((s,x)=>s + x*x, 0); }
+
+  /* ------------- UI ------------- */
+  return (
+    <main className="min-h-screen bg-neutral-950 text-white flex flex-col items-center">
+      <div className="w-full max-w-5xl px-6 pt-6 flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Control</h1>
+        <div className="flex items-center gap-3">
+          <span className={`text-xs px-2 py-1 rounded ${connected ? "bg-emerald-500/30 text-emerald-200" : "bg-rose-500/30 text-rose-200"}`}>
+            socket: {connected ? "connected" : "disconnected"}
+          </span>
+          <button onClick={() => recalibrateSwipe()} className="text-sm px-3 py-1 rounded-lg bg-white/10 border border-white/15 hover:bg-white/15">
+            Recalibrate
+          </button>
+          <button onClick={() => setShowHelp(s=>!s)} className="text-sm px-3 py-1 rounded-lg bg-white/10 border border-white/15 hover:bg-white/15">
+            {showHelp ? "Hide help" : "Help"}
+          </button>
+        </div>
+      </div>
+
+      {showHelp && (
+        <div className="w-full max-w-5xl px-6 mt-4">
+          <div className="rounded-2xl border border-white/15 bg-white/5 p-4 text-sm leading-6">
+            <p className="font-medium mb-2">Gestures</p>
+            <ul className="list-disc pl-6 space-y-1 text-gray-200">
+              <li><b>Two-finger flick</b> (index+middle) <b>Left→Right</b> → <code>next</code></li>
+              <li><b>Two-finger flick</b> (index+middle) <b>Right→Left</b> → <code>prev</code></li>
+              <li><b>Fist (hold)</b> ~300ms → <code>pause / unpause</code></li>
+            </ul>
+            <p className="mt-2 text-gray-300">Tip: keep the flick quick and mostly horizontal; use Recalibrate if motion feels off-center.</p>
+          </div>
+        </div>
+      )}
+
+      <div className="w-full max-w-5xl px-6 py-6">
+        <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-white/15 shadow-2xl bg-black">
+          <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted />
+          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+          <div className="absolute left-4 top-4 px-3 py-1.5 rounded-lg bg-black/55 border border-white/15 text-sm backdrop-blur-sm">
+            {status}
+          </div>
+        </div>
+      </div>
     </main>
   );
 }

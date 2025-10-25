@@ -1,0 +1,33 @@
+{
+    "manifest_version": 3,
+    "name": "Gesture Remote (Socket)",
+    "version": "1.0.0",
+    "description": "Listens to gesture actions from your server and controls streaming sites.",
+    "permissions": ["tabs", "scripting", "storage"],
+    "host_permissions": [
+      "*://*.netflix.com/*",
+      "*://*.youtube.com/*",
+      "*://*.hulu.com/*",
+      "*://*.disneyplus.com/*",
+      "*://*.primevideo.com/*",
+      "*://*.max.com/*",
+      "*://localhost/*",
+      "*://127.0.0.1/*"
+    ],
+    "background": {
+      "service_worker": "background.js",
+      "type": "module"
+    },
+    "options_ui": { "page": "options.html", "open_in_tab": true },
+    "content_scripts": [
+      {
+        "matches": ["<all_urls>"],
+        "js": ["content.js"],
+        "run_at": "document_idle"
+      }
+    ],
+    "action": {
+      "default_title": "Gesture Remote"
+    }
+  }
+  
