@@ -16,11 +16,15 @@
     <label>
       Server URL (your Next app):
       <input id="url" placeholder="http://localhost:3000" />
+    </label>
+    <label>
+      Channel Key:
+      <input id="channelKey" placeholder="gesture-remote-dev" />
       <button id="save">Save</button>
       <button id="reconnect">Reconnect</button>
     </label>
     <div class="hint">
-      The extension connects to <code>/api/socket_io</code> on this URL and listens for <code>target-update</code>.
+      The extension connects to <code>/api/socket_io</code> on this URL and uses the same channel key as Control.
     </div>
     <script src="options.js"></script>
   </body>

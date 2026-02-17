@@ -2,10 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
+import { createGestureEvent, type GestureEventName } from "@@/lib/gesture-event";
+import { GestureGate } from "@@/lib/gesture-gate";
 
 type MPHands = any;
 type MPDraw = any;
-type Gesture = "pause" | "unpause" | "next" | "prev";
+type LockState = "searching" | "acquiring" | "locked";
 
 /* ========= Tunables (market-grade) ========= */
 const MIRROR_FOR_USER = true;
@@ -27,6 +29,8 @@ const COOLDOWN_NEXT_PREV = 500;
 // Pause toggle (fist hold)
 const FIST_HOLD_FRAMES = 5;    // ~250–300ms @ 60fps
 const PAUSE_COOLDOWN_MS = 600;
+const FIST_CONFIDENCE_MIN = 0.82;
+const PINCH_CONFIDENCE_MIN = 0.78;
 
 // Velocity smoothing
 const VX_SHORT_ALPHA = 0.60;
@@ -42,12 +46,22 @@ const RATIO_MIN = 1.25;
 
 // Vertical motion veto for flick
 const VETO_Y = 0.55;           // if |vy| energy too high vs |vx| → veto
+const LOCK_FRAMES_REQUIRED = 5;
+const LOST_FRAMES_FOR_SEARCHING = 4;
+const TELEMETRY_INTERVAL_MS = 100;
+const DEFAULT_CHANNEL = "gesture-remote-dev";
 
 /* ================ Component ================ */
 export default function ControlPage() {
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState("Waiting for hand…");
   const [showHelp, setShowHelp] = useState(false);
+  const [engineLockState, setEngineLockState] = useState<LockState>("searching");
+  const [engineConfidence, setEngineConfidence] = useState(0);
+  const [lastGesture, setLastGesture] = useState<{ name: GestureEventName; at: number } | null>(null);
+  const [readyReads, setReadyReads] = useState(0);
+  const [sessionStarted, setSessionStarted] = useState(false);
+  const [channelKey, setChannelKey] = useState(DEFAULT_CHANNEL);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -55,11 +69,17 @@ export default function ControlPage() {
   const handsRef = useRef<MPHands | null>(null);
   const drawRef = useRef<MPDraw | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const gateRef = useRef(new GestureGate());
 
   // General state
-  const pausedRef = useRef(false);
   const lastEmitRef = useRef(0);
   const lastActionAtRef = useRef(0);
+  const stableDetectFramesRef = useRef(0);
+  const lostDetectFramesRef = useRef(0);
+  const lockStateRef = useRef<LockState>("searching");
+  const currentConfRef = useRef(0);
+  const lastTelemetryAtRef = useRef(0);
+  const readyReadsRef = useRef(0);
 
   // Grace buffer
   const missStreakRef = useRef(0);
@@ -94,17 +114,63 @@ export default function ControlPage() {
   const now = () => performance.now();
   const clamp = (v:number, a=0, b=1) => Math.max(a, Math.min(b, v));
   const ema = (p:number|null, c:number, a:number) => (p==null ? c : a*p + (1-a)*c);
-  const withinCooldown = (until:number) => now() > until;
 
-  function emit(action: Gesture) {
-    socketRef.current?.emit("control-action", action);
+  function lockLabel(state: LockState) {
+    return state === "locked" ? "LOCKED ON" : state === "acquiring" ? "ACQUIRING" : "SEARCHING";
+  }
+
+  function gestureLabel(name: GestureEventName) {
+    if (name === "play_pause") return "Play/Pause";
+    if (name === "seek_forward") return "Seek +10s";
+    if (name === "seek_backward") return "Seek -10s";
+    if (name === "volume_up") return "Volume +";
+    return "Volume -";
+  }
+
+  function syncTelemetry(force = false) {
+    const t = now();
+    if (!force && t - lastTelemetryAtRef.current < TELEMETRY_INTERVAL_MS) return;
+    lastTelemetryAtRef.current = t;
+    setEngineLockState(lockStateRef.current);
+    setEngineConfidence(currentConfRef.current);
+  }
+
+  function emit(name: GestureEventName, confidence: number) {
+    if (lockStateRef.current !== "locked") return false;
+    if (!sessionStarted) return false;
+    const event = createGestureEvent(name, confidence);
+    if (!gateRef.current.shouldEmit(event)) return false;
+    if (!socketRef.current?.connected) return false;
+
+    socketRef.current?.emit("gesture", event);
     setStatus(
-      action === "pause" ? "⏸ Paused" :
-      action === "unpause" ? "▶️ Playing" :
-      action === "next" ? "➡️ Next" : "⬅️ Previous"
+      name === "play_pause" ? "⏯ Toggle" :
+      name === "seek_forward" ? "➡️ Seek +10s" :
+      name === "seek_backward" ? "⬅️ Seek -10s" :
+      name === "volume_up" ? "🔊 Volume +" : "🔉 Volume -"
     );
     lastEmitRef.current = now();
     lastActionAtRef.current = Date.now();
+    setLastGesture({ name, at: event.timestamp });
+    return true;
+  }
+
+  async function beginSession() {
+    if (sessionStarted) return;
+    if (lockStateRef.current !== "locked" || readyReadsRef.current < 3) return;
+
+    try { await fetch("/api/socket"); } catch {}
+    const s = io("/", {
+      path: "/api/socket_io",
+      auth: { role: "control", channel: channelKey || DEFAULT_CHANNEL },
+      transports: ["websocket", "polling"],
+      reconnection: true,
+    });
+    socketRef.current = s;
+    s.on("connect", () => setConnected(true));
+    s.on("disconnect", () => setConnected(false));
+    setStatus("Session started. Ready to control media.");
+    setSessionStarted(true);
   }
 
   function recalibrateSwipe() {
@@ -117,8 +183,26 @@ export default function ControlPage() {
     microJitterEMARef.current = 0;
     vxWinRef.current = [];
     vyWinRef.current = [];
+    stableDetectFramesRef.current = 0;
+    lostDetectFramesRef.current = 0;
+    readyReadsRef.current = 0;
+    setReadyReads(0);
+    lockStateRef.current = "searching";
+    currentConfRef.current = 0;
+    gateRef.current.reset();
+    syncTelemetry(true);
     setStatus("Recalibrated.");
   }
+
+  useEffect(() => {
+    const saved = typeof window !== "undefined" ? window.localStorage.getItem("gestureRemoteChannel") : null;
+    if (saved && saved.trim()) setChannelKey(saved.trim());
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("gestureRemoteChannel", channelKey || DEFAULT_CHANNEL);
+  }, [channelKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -133,12 +217,6 @@ export default function ControlPage() {
       });
 
     async function init() {
-      try { await fetch("/api/socket"); } catch {}
-      const s = io("/", { path: "/api/socket_io", transports: ["websocket","polling"], reconnection: true });
-      socketRef.current = s;
-      s.on("connect", () => setConnected(true));
-      s.on("disconnect", () => setConnected(false));
-
       await loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js");
       await loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js");
       if (cancelled) return;
@@ -216,17 +294,37 @@ export default function ControlPage() {
     ctx.save(); ctx.scale(-1,1); ctx.drawImage(video, -w, 0, w, h); ctx.restore();
 
     const hands = results.multiHandLandmarks as Array<Array<{x:number;y:number;z:number}>> | undefined;
-    const conf = (results.multiHandedness?.[0]?.score ?? 1) as number;
+    const confs = (results.multiHandedness ?? [])
+      .map((x:any) => (typeof x?.score === "number" ? x.score : 0));
+    const conf = confs.length ? Math.max(...confs) : 0;
     const detOK = !!hands && hands.length > 0 && conf >= MIN_DET;
+    currentConfRef.current = clamp(conf, 0, 1);
 
     if (detOK) {
       missStreakRef.current = 0;
       lastGoodTsRef.current = now();
       lastGoodHandsRef.current = hands!;
-      if (status === "Waiting for hand…") setStatus("Tracking… Two-finger flick for Next/Prev; Fist-hold to Pause.");
+      stableDetectFramesRef.current += 1;
+      lostDetectFramesRef.current = 0;
+      lockStateRef.current = stableDetectFramesRef.current >= LOCK_FRAMES_REQUIRED ? "locked" : "acquiring";
+      if (lockStateRef.current === "locked" && readyReadsRef.current < 3) {
+        readyReadsRef.current += 1;
+        setReadyReads(readyReadsRef.current);
+      }
+      if (status === "Waiting for hand…") {
+        setStatus("Tracking… Two-finger flick to seek; fist-hold to toggle play/pause.");
+      }
     } else {
       missStreakRef.current++;
+      stableDetectFramesRef.current = 0;
+      lostDetectFramesRef.current += 1;
+      if (lostDetectFramesRef.current >= LOST_FRAMES_FOR_SEARCHING) {
+        lockStateRef.current = "searching";
+        readyReadsRef.current = 0;
+        setReadyReads(0);
+      }
     }
+    syncTelemetry();
 
     const withinGrace = !detOK && lastGoodHandsRef.current && (now() - lastGoodTsRef.current) <= HOLD_LAST_MS;
     const lmSet = detOK ? hands! : (withinGrace ? lastGoodHandsRef.current! : null);
@@ -240,18 +338,21 @@ export default function ControlPage() {
     // Draw all hands
     for (const lm of lmSet) drawHand(ctx, lm);
 
-    // ---- Pause/Unpause: Fist hold (any hand) ----
-    const fistAny = lmSet.some(lm => fistConfFromCurl(lm) > 0.92);
-    if (fistAny) fistHoldRef.current++; else fistHoldRef.current = 0;
+    // ---- Play/Pause: Fist hold (any hand) ----
+    const fistConfidence = lmSet.reduce((best, lm) => Math.max(best, fistConfFromCurl(lm)), 0);
+    const pinchConfidence = lmSet.reduce((best, lm) => Math.max(best, pinchConf(lm)), 0);
+    const pauseConfidence = Math.max(fistConfidence, pinchConfidence);
+    const pauseAny = fistConfidence > FIST_CONFIDENCE_MIN || pinchConfidence > PINCH_CONFIDENCE_MIN;
+    if (pauseAny) fistHoldRef.current++; else fistHoldRef.current = 0;
 
     if (fistHoldRef.current >= FIST_HOLD_FRAMES && now() > pauseCooldownUntilRef.current) {
       fistHoldRef.current = 0;
       pauseCooldownUntilRef.current = now() + PAUSE_COOLDOWN_MS;
-      if (!pausedRef.current) { pausedRef.current = true; emit("pause"); }
-      else { pausedRef.current = false; emit("unpause"); recalibrateSwipe(); }
+      emit("play_pause", pauseConfidence);
+      recalibrateSwipe();
     }
 
-    // ---- Next/Prev: Two-finger flick (index+middle extended, others curled) ----
+    // ---- Seek: Two-finger flick (index+middle extended, others curled) ----
     // Pick a hand that matches the posture best; otherwise use first
     const scored = lmSet.map(lm => ({ lm, score: twoFingerPoseScore(lm) }));
     scored.sort((a,b)=>b.score - a.score);
@@ -347,12 +448,13 @@ export default function ControlPage() {
       const cooled = now() > nextPrevCooldownUntilRef.current;
 
       if (cooled && armedRef.current && withinWindow && fastEnough && ratioOK && !yVeto) {
-        const action: Gesture = vxEMA > 0 ? "next" : "prev";
-        emit(action);
-        nextPrevCooldownUntilRef.current = now() + COOLDOWN_NEXT_PREV;
+        const action: GestureEventName = vxEMA > 0 ? "seek_forward" : "seek_backward";
+        const confidence = clamp((velScore - 0.75) / 0.8, 0, 1);
+        const emitted = emit(action, confidence);
+        if (emitted) nextPrevCooldownUntilRef.current = now() + COOLDOWN_NEXT_PREV;
 
         // learn trigger slightly if borderline
-        if (velScore < 1.05) vxTrigRef.current = Math.max(VX_TRIG_FLOOR, vxTrigRef.current * 0.985);
+        if (emitted && velScore < 1.05) vxTrigRef.current = Math.max(VX_TRIG_FLOOR, vxTrigRef.current * 0.985);
 
         // reset flick state
         anchorRef.current = null;
@@ -490,6 +592,15 @@ export default function ControlPage() {
     return clamp(c, 0, 1);
   }
 
+  function pinchConf(lm:any) {
+    const thumbTip = lm[4];
+    const idxTip = lm[8];
+    const pinchDist = dist(thumbTip, idxTip);
+    const norm = Math.max(1e-5, palmScale(lm));
+    const ratio = pinchDist / norm;
+    return clamp(1 - (ratio - 0.08) / 0.42, 0, 1);
+  }
+
   function pushSigned(win:number[], v:number, cap:number){ win.push(v); if (win.length>cap) win.shift(); }
   function energy(xs:number[]){ return xs.reduce((s,x)=>s + x*x, 0); }
 
@@ -516,9 +627,9 @@ export default function ControlPage() {
           <div className="rounded-2xl border border-white/15 bg-white/5 p-4 text-sm leading-6">
             <p className="font-medium mb-2">Gestures</p>
             <ul className="list-disc pl-6 space-y-1 text-gray-200">
-              <li><b>Two-finger flick</b> (index+middle) <b>Left→Right</b> → <code>next</code></li>
-              <li><b>Two-finger flick</b> (index+middle) <b>Right→Left</b> → <code>prev</code></li>
-              <li><b>Fist (hold)</b> ~300ms → <code>pause / unpause</code></li>
+              <li><b>Two-finger flick</b> (index+middle) <b>Left→Right</b> → <code>seek_forward</code></li>
+              <li><b>Two-finger flick</b> (index+middle) <b>Right→Left</b> → <code>seek_backward</code></li>
+              <li><b>Fist hold</b> or <b>thumb-index pinch hold</b> ~300ms → <code>play_pause</code></li>
             </ul>
             <p className="mt-2 text-gray-300">Tip: keep the flick quick and mostly horizontal; use Recalibrate if motion feels off-center.</p>
           </div>
@@ -526,6 +637,48 @@ export default function ControlPage() {
       )}
 
       <div className="w-full max-w-5xl px-6 py-6">
+        <section className="mb-4 rounded-2xl border border-white/15 bg-white/5 p-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs uppercase tracking-wider text-gray-300">Engine Lock</span>
+            <span className={`text-xs px-2 py-1 rounded ${
+              engineLockState === "locked"
+                ? "bg-emerald-500/30 text-emerald-200"
+                : engineLockState === "acquiring"
+                ? "bg-amber-500/30 text-amber-200"
+                : "bg-rose-500/30 text-rose-200"
+            }`}>
+              {lockLabel(engineLockState)}
+            </span>
+            <span className="text-xs text-gray-300">confidence: {(engineConfidence * 100).toFixed(0)}%</span>
+            <span className="text-xs text-gray-300">socket: {connected ? "connected" : "disconnected"}</span>
+            <span className="text-xs text-gray-300">read checks: {readyReads}/3</span>
+            <label className="text-xs text-gray-300 flex items-center gap-2">
+              channel:
+              <input
+                value={channelKey}
+                onChange={(e) => setChannelKey(e.target.value)}
+                className="px-2 py-1 rounded border border-white/20 bg-black/40 text-white"
+              />
+            </label>
+            <button
+              onClick={() => beginSession()}
+              disabled={sessionStarted || engineLockState !== "locked" || readyReads < 3}
+              className={`text-xs px-2 py-1 rounded border ${
+                sessionStarted
+                  ? "border-emerald-300/50 bg-emerald-500/20 text-emerald-200"
+                  : engineLockState === "locked" && readyReads >= 3
+                  ? "border-white/30 bg-white/10 hover:bg-white/15"
+                  : "border-white/15 bg-white/5 text-gray-400 cursor-not-allowed"
+              }`}
+            >
+              {sessionStarted ? "Session started" : "Begin"}
+            </button>
+            <span className="text-xs text-gray-300">
+              last gesture: {lastGesture ? `${gestureLabel(lastGesture.name)} (${new Date(lastGesture.at).toLocaleTimeString()})` : "none"}
+            </span>
+          </div>
+        </section>
+
         <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-white/15 shadow-2xl bg-black">
           <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" playsInline muted />
           <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />

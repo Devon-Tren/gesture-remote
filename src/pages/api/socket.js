@@ -1,4 +1,8 @@
 import { Server } from "socket.io";
+import { isGestureEvent } from "../../lib/gesture-event";
+
+const CHANNEL_KEY = process.env.GESTURE_REMOTE_CHANNEL || "gesture-remote-dev";
+const MAX_EVENT_AGE_MS = 8000;
 
 export default function handler(req, res) {
   if (res.socket.server.io) {
@@ -16,10 +20,30 @@ export default function handler(req, res) {
   res.socket.server.io = io;
 
   io.on("connection", (socket) => {
-    console.log("Client connected");
+    const auth = socket.handshake?.auth || {};
+    const role = auth?.role;
+    const channel = auth?.channel;
+    if (channel !== CHANNEL_KEY) {
+      socket.disconnect(true);
+      return;
+    }
+    if (role !== "control" && role !== "extension" && role !== "monitor") {
+      socket.disconnect(true);
+      return;
+    }
+    socket.data.role = role;
+    socket.data.lastGestureTs = 0;
 
     socket.on("gesture", (data) => {
-      console.log("👉 Gesture received:", data);
+      if (socket.data.role !== "control") return;
+      if (!isGestureEvent(data)) {
+        console.warn("⚠️ invalid gesture payload ignored");
+        return;
+      }
+      const now = Date.now();
+      if (Math.abs(now - data.timestamp) > MAX_EVENT_AGE_MS) return;
+      if (data.timestamp <= socket.data.lastGestureTs) return;
+      socket.data.lastGestureTs = data.timestamp;
       io.emit("gesture", data); // broadcast to everyone
     });
   });
