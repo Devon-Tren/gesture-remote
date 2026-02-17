@@ -27,7 +27,7 @@ const ARM_STILL_MS = 70;       // brief stillness before arming
 const COOLDOWN_NEXT_PREV = 500;
 
 // Pause toggle (fist hold)
-const FIST_HOLD_FRAMES = 5;    // ~250–300ms @ 60fps
+const FIST_HOLD_FRAMES = 4;    // ~200–250ms @ 60fps
 const PAUSE_COOLDOWN_MS = 600;
 const FIST_CONFIDENCE_MIN = 0.82;
 const PINCH_CONFIDENCE_MIN = 0.78;
@@ -46,7 +46,7 @@ const RATIO_MIN = 1.25;
 
 // Vertical motion veto for flick
 const VETO_Y = 0.55;           // if |vy| energy too high vs |vx| → veto
-const LOCK_FRAMES_REQUIRED = 5;
+const LOCK_FRAMES_REQUIRED = 3;
 const LOST_FRAMES_FOR_SEARCHING = 4;
 const TELEMETRY_INTERVAL_MS = 100;
 const DEFAULT_CHANNEL = "gesture-remote-dev";
